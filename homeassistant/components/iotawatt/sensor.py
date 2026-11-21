@@ -21,6 +21,7 @@ from homeassistant.const import (
     UnitOfEnergy,
     UnitOfFrequency,
     UnitOfPower,
+    UnitOfReactivePower,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr, entity_registry as er
@@ -29,7 +30,7 @@ from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import VOLT_AMPERE_REACTIVE, VOLT_AMPERE_REACTIVE_HOURS
+from .const import VOLT_AMPERE_REACTIVE_HOURS
 from .coordinator import IotawattConfigEntry, IotawattUpdater
 
 _LOGGER = logging.getLogger(__name__)
@@ -87,9 +88,9 @@ ENTITY_DESCRIPTION_KEY_MAP: dict[str, IotaWattSensorEntityDescription] = {
     ),
     "VAR": IotaWattSensorEntityDescription(
         key="VAR",
-        native_unit_of_measurement=VOLT_AMPERE_REACTIVE,
+        native_unit_of_measurement=UnitOfReactivePower.VOLT_AMPERE_REACTIVE,
         state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:flash",
+        device_class=SensorDeviceClass.REACTIVE_POWER,
         entity_registry_enabled_default=False,
     ),
     "VARh": IotaWattSensorEntityDescription(
@@ -175,6 +176,7 @@ class IotaWattSensor(CoordinatorEntity[IotawattUpdater], SensorEntity):
                 model="IoTaWatt",
             )
         self.entity_description = entity_description
+        self._update_last_reset()
 
     @property
     def _sensor_data(self) -> Sensor:
@@ -198,12 +200,15 @@ class IotaWattSensor(CoordinatorEntity[IotawattUpdater], SensorEntity):
                 self.hass.async_create_task(self.async_remove())
             return
 
+        self._update_last_reset()
+        super()._handle_coordinator_update()
+
+    def _update_last_reset(self) -> None:
+        """Set last_reset from the start of the IoTaWatt query period."""
         if (begin := self._sensor_data.getBegin()) and (
             last_reset := dt_util.parse_datetime(begin)
         ):
             self._attr_last_reset = last_reset
-
-        super()._handle_coordinator_update()
 
     @property
     @override

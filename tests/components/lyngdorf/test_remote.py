@@ -2,29 +2,28 @@
 
 from unittest.mock import MagicMock, patch
 
-from lyngdorf.const import LyngdorfModel
+from lyngdorf import LyngdorfModel
 from lyngdorf.exceptions import LyngdorfUnsupportedError
 from lyngdorf.remote import RemoteKey, resolve_remote_key
 import pytest
+from pytest_homeassistant.common import MockConfigEntry, snapshot_platform
 from syrupy.assertion import SnapshotAssertion
 
 from homeassistant.components.remote import (
-    ATTR_COMMAND,
-    ATTR_NUM_REPEATS,
     DOMAIN as REMOTE_DOMAIN,
-    SERVICE_SEND_COMMAND,
+    RemoteService,
+    RemoteServiceArgument,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
     Platform,
+    TargetKey,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
-
-from tests.common import MockConfigEntry, snapshot_platform
 
 REMOTE = "remote.mock_lyngdorf"
 
@@ -53,15 +52,19 @@ async def test_send_command(
     """Test sending a sequence of remote keys."""
     await hass.services.async_call(
         REMOTE_DOMAIN,
-        SERVICE_SEND_COMMAND,
+        RemoteService.SEND_COMMAND,
         {
-            ATTR_ENTITY_ID: REMOTE,
-            ATTR_COMMAND: [RemoteKey.MENU, RemoteKey.DOWN, RemoteKey.ENTER],
+            TargetKey.ENTITY_ID: REMOTE,
+            RemoteServiceArgument.COMMAND: [
+                RemoteKey.MENU,
+                RemoteKey.DOWN,
+                RemoteKey.ENTER,
+            ],
         },
         blocking=True,
     )
 
-    mock_receiver.send_remote_commands.assert_called_once_with(
+    mock_receiver.remote.send.assert_awaited_once_with(
         [RemoteKey.MENU, RemoteKey.DOWN, RemoteKey.ENTER], num_repeats=1
     )
 
@@ -74,18 +77,16 @@ async def test_send_command_repeats(
     """Test the repeat count is passed through to the library."""
     await hass.services.async_call(
         REMOTE_DOMAIN,
-        SERVICE_SEND_COMMAND,
+        RemoteService.SEND_COMMAND,
         {
-            ATTR_ENTITY_ID: REMOTE,
-            ATTR_COMMAND: [RemoteKey.DOWN],
-            ATTR_NUM_REPEATS: 3,
+            TargetKey.ENTITY_ID: REMOTE,
+            RemoteServiceArgument.COMMAND: [RemoteKey.DOWN],
+            RemoteServiceArgument.NUM_REPEATS: 3,
         },
         blocking=True,
     )
 
-    mock_receiver.send_remote_commands.assert_called_once_with(
-        [RemoteKey.DOWN], num_repeats=3
-    )
+    mock_receiver.remote.send.assert_awaited_once_with([RemoteKey.DOWN], num_repeats=3)
 
 
 @pytest.mark.usefixtures("init_integration")
@@ -94,15 +95,13 @@ async def test_send_unsupported_command(
     mock_receiver: MagicMock,
 ) -> None:
     """Test a key the model does not have is reported to the user."""
-    mock_receiver.send_remote_commands.side_effect = LyngdorfUnsupportedError(
-        "no such key"
-    )
+    mock_receiver.remote.send.side_effect = LyngdorfUnsupportedError("no such key")
 
     with pytest.raises(ServiceValidationError) as err:
         await hass.services.async_call(
             REMOTE_DOMAIN,
-            SERVICE_SEND_COMMAND,
-            {ATTR_ENTITY_ID: REMOTE, ATTR_COMMAND: ["nonsense"]},
+            RemoteService.SEND_COMMAND,
+            {TargetKey.ENTITY_ID: REMOTE, RemoteServiceArgument.COMMAND: ["nonsense"]},
             blocking=True,
         )
 
@@ -135,7 +134,7 @@ async def test_power(
         blocking=True,
     )
 
-    assert mock_receiver.power_on is expected
+    mock_receiver.set_power.assert_awaited_once_with(expected)
 
 
 @pytest.mark.usefixtures("mock_receiver")
@@ -146,7 +145,7 @@ async def test_no_entity_for_model_without_remote_keys(
     entity_registry: er.EntityRegistry,
 ) -> None:
     """Test no remote entity is created for a model with no remote keys."""
-    mock_receiver.has_remote_keys = False
+    mock_receiver.remote = None
     mock_config_entry.add_to_hass(hass)
 
     with (

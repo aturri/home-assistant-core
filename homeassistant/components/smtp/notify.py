@@ -7,31 +7,24 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import email.utils
 import logging
-from smtplib import (
-    SMTP,
-    SMTP_SSL,
-    SMTPAuthenticationError,
-    SMTPException,
-    SMTPServerDisconnected,
-)
-from socket import gaierror
+from smtplib import SMTPException, SMTPServerDisconnected
 from ssl import SSLContext
 from typing import TYPE_CHECKING, Any, override
 
-import voluptuous as vol
+import aiosmtplib
+import probatio
 
 from homeassistant.components.notify import (
-    ATTR_DATA,
-    ATTR_TARGET,
-    ATTR_TITLE,
     ATTR_TITLE_DEFAULT,
     PLATFORM_SCHEMA as NOTIFY_PLATFORM_SCHEMA,
     BaseNotificationService,
     NotifyEntity,
     NotifyEntityFeature,
+    NotifyServiceArgument,
 )
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigSubentry
 from homeassistant.const import (
+    APPLICATION_NAME,
     CONF_DEBUG,
     CONF_PASSWORD,
     CONF_PORT,
@@ -41,14 +34,11 @@ from homeassistant.const import (
     CONF_USERNAME,
     CONF_VERIFY_SSL,
     Platform,
+    __version__,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.exceptions import (
-    ConfigEntryAuthFailed,
-    HomeAssistantError,
-    ServiceValidationError,
-)
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -58,15 +48,12 @@ from homeassistant.util.ssl import create_client_context
 
 from . import SmtpConfigEntry
 from .const import (
-    ATTR_ATTACHMENTS,
-    ATTR_CONTENT_ID,
-    ATTR_FILENAME,
     ATTR_HTML,
     ATTR_IMAGES,
-    ATTR_MEDIA_SOURCE,
-    ATTR_PRIORITY,
     CONF_ENCRYPTION,
     CONF_ENTRY,
+    CONF_REPLY_TO,
+    CONF_REPLY_TO_NAME,
     CONF_SENDER_NAME,
     CONF_SERVER,
     DEFAULT_DEBUG,
@@ -76,6 +63,8 @@ from .const import (
     DEFAULT_TIMEOUT,
     DOMAIN,
     ENCRYPTION_OPTIONS,
+    SMTPServiceArgument,
+    SMTPServiceAttachment,
 )
 from .helpers import (
     SmtpClient,
@@ -92,21 +81,25 @@ _LOGGER = logging.getLogger(__name__)
 
 PARALLEL_UPDATES = 1
 
+RETRIES = 2
+
 PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_RECIPIENT): vol.All(cv.ensure_list, [vol.Email()]),
-        vol.Required(CONF_SENDER): vol.Email(),
-        vol.Optional(CONF_SERVER, default=DEFAULT_HOST): cv.string,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-        vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
-        vol.Optional(CONF_ENCRYPTION, default=DEFAULT_ENCRYPTION): vol.In(
+        probatio.Required(CONF_RECIPIENT): probatio.All(
+            probatio.EnsureList(), [probatio.Email()]
+        ),
+        probatio.Required(CONF_SENDER): probatio.Email(),
+        probatio.Optional(CONF_SERVER, default=DEFAULT_HOST): cv.string,
+        probatio.Optional(CONF_PORT, default=DEFAULT_PORT): probatio.Port(),
+        probatio.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
+        probatio.Optional(CONF_ENCRYPTION, default=DEFAULT_ENCRYPTION): probatio.In(
             ENCRYPTION_OPTIONS
         ),
-        vol.Optional(CONF_USERNAME): cv.string,
-        vol.Optional(CONF_PASSWORD): cv.string,
-        vol.Optional(CONF_SENDER_NAME): cv.string,
-        vol.Optional(CONF_DEBUG, default=DEFAULT_DEBUG): cv.boolean,
-        vol.Optional(CONF_VERIFY_SSL, default=True): cv.boolean,
+        probatio.Optional(CONF_USERNAME): cv.string,
+        probatio.Optional(probatio.Secret(CONF_PASSWORD)): cv.string,
+        probatio.Optional(CONF_SENDER_NAME): cv.string,
+        probatio.Optional(CONF_DEBUG, default=DEFAULT_DEBUG): cv.boolean,
+        probatio.Optional(CONF_VERIFY_SSL, default=True): cv.boolean,
     }
 )
 
@@ -198,7 +191,7 @@ class MailNotifyEntity(NotifyEntity):
         self,
         entry: SmtpConfigEntry,
         subentry: ConfigSubentry,
-        client: SmtpClient,
+        client: aiosmtplib.SMTP,
     ) -> None:
         """Initialize the notify entity."""
 
@@ -214,14 +207,14 @@ class MailNotifyEntity(NotifyEntity):
         self._attr_name = subentry.title
 
     @override
-    def send_message(self, message: str, title: str | None = None) -> None:
+    async def async_send_message(self, message: str, title: str | None = None) -> None:
         """Send an email message via notify.send_message action."""
 
         msg = EmailMessage()
         msg.set_content(message)
         msg["Subject"] = title or ATTR_TITLE_DEFAULT
 
-        self._send_email(msg=msg)
+        await self._send_email(msg=msg)
 
     async def smtp_send_message(
         self,
@@ -234,17 +227,19 @@ class MailNotifyEntity(NotifyEntity):
         msg.set_content(message)
         msg.add_header("Subject", title or ATTR_TITLE_DEFAULT)
 
-        if ATTR_PRIORITY in kwargs:
-            msg.add_header("X-Priority", MAP_X_PRIORITY[kwargs[ATTR_PRIORITY]])
+        if SMTPServiceArgument.PRIORITY in kwargs:
+            msg.add_header(
+                "X-Priority", MAP_X_PRIORITY[kwargs[SMTPServiceArgument.PRIORITY]]
+            )
 
-        if ATTR_HTML in kwargs:
-            msg.add_alternative(kwargs[ATTR_HTML], subtype="html")
+        if SMTPServiceArgument.HTML in kwargs:
+            msg.add_alternative(kwargs[SMTPServiceArgument.HTML], subtype="html")
 
-        attachments = kwargs.get(ATTR_ATTACHMENTS, [])
+        attachments = kwargs.get(SMTPServiceArgument.ATTACHMENTS, [])
 
         resolved = await asyncio.gather(
             *(
-                _resolve_media(self.hass, file[ATTR_MEDIA_SOURCE])
+                _resolve_media(self.hass, file[SMTPServiceAttachment.MEDIA_SOURCE])
                 for file in attachments
             )
         )
@@ -258,16 +253,20 @@ class MailNotifyEntity(NotifyEntity):
                 else ("application", "octet-stream")
             )
 
-            if not (target_filename := file.get(ATTR_FILENAME, filename)):
+            if not (
+                target_filename := file.get(SMTPServiceAttachment.FILENAME, filename)
+            ):
                 raise ServiceValidationError(
                     translation_domain=DOMAIN,
                     translation_key="media_source_missing_filename",
                     translation_placeholders={
-                        "media_content_id": file[ATTR_MEDIA_SOURCE]["media_content_id"]
+                        "media_content_id": file[SMTPServiceAttachment.MEDIA_SOURCE][
+                            "media_content_id"
+                        ]
                     },
                 )
             if (html_part := msg.get_body(("related", "html"))) and (
-                cid := file.get(ATTR_CONTENT_ID)
+                cid := file.get(SMTPServiceAttachment.CONTENT_ID)
             ):
                 html_part.add_related(
                     content,
@@ -285,10 +284,10 @@ class MailNotifyEntity(NotifyEntity):
                     filename=target_filename,
                 )
 
-        await self.hass.async_add_executor_job(self._send_email, msg)
+        await self._send_email(msg)
         self._async_record_notification()
 
-    def _send_email(self, msg: EmailMessage) -> None:
+    async def _send_email(self, msg: EmailMessage) -> None:
         """Send the message."""
         if TYPE_CHECKING:
             assert self._subentry.unique_id
@@ -303,45 +302,40 @@ class MailNotifyEntity(NotifyEntity):
             "To",
             email.utils.formataddr((self._subentry.title, self._subentry.unique_id)),
         )
+
+        if reply_to := self._entry.options.get(CONF_REPLY_TO):
+            msg.add_header(
+                "Reply-To",
+                email.utils.formataddr(
+                    (self._entry.options.get(CONF_REPLY_TO_NAME), reply_to)
+                ),
+            )
+
         msg.add_header("X-Mailer", "Home Assistant")
+        msg.add_header("User-Agent", f"{APPLICATION_NAME}/{__version__}")
         msg.add_header("Date", email.utils.format_datetime(dt_util.now()))
         msg.add_header("Message-Id", email.utils.make_msgid())
 
-        client: SMTP_SSL | SMTP | None = None
-        for attempt in range(self._client.tries):
+        for attempt in range(RETRIES):
             try:
-                client = self._client.connect()
-            except SMTPAuthenticationError as e:
-                raise ConfigEntryAuthFailed(
+                async with self._client as client:
+                    await client.send_message(msg)
+                break
+            except aiosmtplib.SMTPAuthenticationError as e:
+                self._entry.async_start_reauth(self.hass)
+                raise HomeAssistantError(
                     translation_domain=DOMAIN,
                     translation_key="authentication_error",
                 ) from e
-            except (gaierror, ConnectionRefusedError, SMTPException) as e:
-                _LOGGER.debug("Full exception:", exc_info=True)
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="send_mail_connection_error",
-                ) from e
-
-            try:
-                client.sendmail(
-                    self._entry.data[CONF_SENDER],
-                    self._subentry.unique_id,
-                    msg.as_string(),
-                )
-                break
-            except SMTPException as e:
+            except aiosmtplib.SMTPException as e:
                 _LOGGER.debug(
                     "Error sending mail at attempt %s:", attempt + 1, exc_info=True
                 )
-                if attempt == self._client.tries - 1:
+                if attempt == RETRIES - 1:
                     raise HomeAssistantError(
                         translation_domain=DOMAIN,
                         translation_key="send_mail_connection_error",
                     ) from e
-            finally:
-                with suppress(SMTPException):
-                    client.quit()
 
 
 class MailNotificationService(SmtpClient, BaseNotificationService):
@@ -377,10 +371,10 @@ class MailNotificationService(SmtpClient, BaseNotificationService):
         defined, or will build a multipart HTML if html config is defined.
         """
 
-        subject = kwargs.get(ATTR_TITLE, ATTR_TITLE_DEFAULT)
+        subject = kwargs.get(NotifyServiceArgument.TITLE, ATTR_TITLE_DEFAULT)
 
         msg: MIMEMultipart | MIMEText
-        if data := kwargs.get(ATTR_DATA):
+        if data := kwargs.get(NotifyServiceArgument.DATA):
             if ATTR_HTML in data:
                 msg = _build_html_msg(
                     self.hass,
@@ -397,7 +391,7 @@ class MailNotificationService(SmtpClient, BaseNotificationService):
 
         msg["Subject"] = subject
 
-        if targets := kwargs.get(ATTR_TARGET):
+        if targets := kwargs.get(NotifyServiceArgument.TARGET):
             recipients: list[str] = targets  # ensured by NOTIFY_SERVICE_SCHEMA
         else:
             recipients = self.recipients
