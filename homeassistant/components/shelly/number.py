@@ -1,12 +1,14 @@
 """Number for Shelly."""
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, cast, override
+from typing import TYPE_CHECKING, Any, Final, cast, override
 
 from aioshelly.block_device import Block
 from aioshelly.const import RPC_GENERATIONS
 from aioshelly.exceptions import DeviceConnectionError, InvalidAuthError
+from aioshelly.rpc_device import RpcDevice
+from aioshelly.rpc_device.models import ShellyWallDisplayUiBrightness
 
 from homeassistant.components.number import (
     DOMAIN as NUMBER_DOMAIN,
@@ -30,7 +32,6 @@ from .const import (
     MODEL_FRANKEVER_WATER_VALVE,
     MODEL_LINKEDGO_ST802_THERMOSTAT,
     MODEL_LINKEDGO_ST1820_THERMOSTAT,
-    MODEL_TOP_EV_CHARGER_EVE01,
     ROLE_GENERIC,
     TRV_CHANNEL,
     VIRTUAL_NUMBER_MODE_MAP,
@@ -40,6 +41,7 @@ from .entity import (
     BlockEntityDescription,
     RpcEntityDescription,
     ShellyRpcAttributeEntity,
+    ShellyRpcEntity,
     ShellySleepingBlockAttributeEntity,
     async_setup_entry_block,
     async_setup_entry_rpc,
@@ -51,7 +53,9 @@ from .utils import (
     get_device_entry_gen,
     get_virtual_component_ids,
     get_virtual_component_unit,
+    get_virtual_component_view,
     is_rpc_ledstrip_control_available,
+    is_rpc_wall_display_brightness_supported,
     is_view_for_platform,
 )
 
@@ -71,8 +75,7 @@ class RpcNumberDescription(RpcEntityDescription, NumberEntityDescription):
     min_fn: Callable[[dict], float] | None = None
     step_fn: Callable[[dict], float] | None = None
     mode_fn: Callable[[dict], NumberMode] | None = None
-    slot: str | None = None
-    method: str
+    method: Callable[[RpcDevice, int, float], Awaitable[None]]
 
 
 class RpcNumber(ShellyRpcAttributeEntity, NumberEntity):
@@ -80,7 +83,7 @@ class RpcNumber(ShellyRpcAttributeEntity, NumberEntity):
 
     entity_description: RpcNumberDescription
     attribute_value: float | None
-    _id: int | None
+    _id: int
 
     def __init__(
         self,
@@ -115,29 +118,7 @@ class RpcNumber(ShellyRpcAttributeEntity, NumberEntity):
     @override
     async def async_set_native_value(self, value: float) -> None:
         """Change the value."""
-        method = getattr(self.coordinator.device, self.entity_description.method)
-
-        if TYPE_CHECKING:
-            assert method is not None
-
-        await method(self._id, value)
-
-
-class RpcCuryIntensityNumber(RpcNumber):
-    """Represent a RPC Cury Intensity entity."""
-
-    @rpc_call
-    @override
-    async def async_set_native_value(self, value: float) -> None:
-        """Change the value."""
-        method = getattr(self.coordinator.device, self.entity_description.method)
-
-        if TYPE_CHECKING:
-            assert method is not None
-
-        await method(
-            self._id, slot=self.entity_description.slot, intensity=round(value)
-        )
+        await self.entity_description.method(self.coordinator.device, self._id, value)
 
 
 class RpcLedStripNumber(RpcNumber):
@@ -156,16 +137,61 @@ class RpcLedStripNumber(RpcNumber):
             self.entity_description.sub_key,
         )
 
+
+@dataclass(frozen=True, kw_only=True)
+class RpcWallDisplayBrightnessNumberDescription(NumberEntityDescription):
+    """Class to describe a RPC Wall Display brightness number."""
+
+    entity_class: type[RpcWallDisplayBrightnessNumber]
+
+
+class RpcWallDisplayBrightnessNumber(ShellyRpcEntity, NumberEntity):
+    """Represent a RPC Wall Display brightness config number."""
+
+    entity_description: RpcWallDisplayBrightnessNumberDescription
+
+    def __init__(
+        self,
+        coordinator: ShellyRpcCoordinator,
+        description: RpcWallDisplayBrightnessNumberDescription,
+    ) -> None:
+        """Initialize Wall Display brightness number."""
+        super().__init__(coordinator, "ui")
+        self.entity_description = description
+        self._attr_unique_id = f"{coordinator.mac}-ui-{description.key}"
+
+    @property
+    def brightness_config(self) -> dict[str, Any]:
+        """Display brightness config."""
+        return cast(dict[str, Any], self.coordinator.device.config["ui"]["brightness"])
+
+    @property
+    @override
+    def native_value(self) -> float:
+        """Return the brightness config value."""
+        return cast(float, self.brightness_config[self.entity_description.key])
+
     @rpc_call
     @override
     async def async_set_native_value(self, value: float) -> None:
-        """Change the value."""
-        method = getattr(self.coordinator.device, self.entity_description.method)
+        """Change the brightness config value."""
+        brightness = cast(
+            ShellyWallDisplayUiBrightness, {self.entity_description.key: round(value)}
+        )
+        await self.coordinator.device.wall_display_ui_setconfig(
+            {"brightness": brightness}
+        )
 
-        if TYPE_CHECKING:
-            assert method is not None
 
-        await method(self._id, {self.entity_description.sub_key: round(value)})
+class RpcWallDisplayLevelNumber(RpcWallDisplayBrightnessNumber):
+    """Represent a RPC Wall Display brightness level number."""
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return if entity is available."""
+        # The device ignores the level while auto brightness is on
+        return super().available and not self.brightness_config["auto"]
 
 
 class RpcBluTrvNumber(RpcNumber):
@@ -232,7 +258,9 @@ RPC_NUMBERS: Final = (
         entity_category=EntityCategory.CONFIG,
         device_class=NumberDeviceClass.TEMPERATURE,
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
-        method="blu_trv_set_external_temperature",
+        method=lambda device, id_, value: device.blu_trv_set_external_temperature(
+            id_, value
+        ),
         entity_class=RpcBluTrvExtTempNumber,
     ),
     RpcNumberDescription(
@@ -245,11 +273,11 @@ RPC_NUMBERS: Final = (
         max_fn=lambda config: config["max"],
         min_fn=lambda config: config["min"],
         mode_fn=lambda config: VIRTUAL_NUMBER_MODE_MAP.get(
-            config["meta"]["ui"]["view"], NumberMode.BOX
+            get_virtual_component_view(config), NumberMode.BOX
         ),
         step_fn=lambda config: config["meta"]["ui"].get("step"),
         unit=get_virtual_component_unit,
-        method="number_set",
+        method=lambda device, id_, value: device.number_set(id_, value),
         role=ROLE_GENERIC,
     ),
     RpcNumberDescription(
@@ -263,9 +291,8 @@ RPC_NUMBERS: Final = (
         mode_fn=lambda _: NumberMode.SLIDER,
         step_fn=lambda config: config["meta"]["ui"].get("step"),
         unit=get_virtual_component_unit,
-        method="number_set",
+        method=lambda device, id_, value: device.number_set(id_, value),
         role="current_limit",
-        models={MODEL_TOP_EV_CHARGER_EVE01},
     ),
     RpcNumberDescription(
         key="number_position",
@@ -278,7 +305,7 @@ RPC_NUMBERS: Final = (
         mode_fn=lambda _: NumberMode.SLIDER,
         step_fn=lambda config: config["meta"]["ui"].get("step"),
         unit=get_virtual_component_unit,
-        method="number_set",
+        method=lambda device, id_, value: device.number_set(id_, value),
         role="position",
         models={MODEL_FRANKEVER_WATER_VALVE},
     ),
@@ -294,7 +321,7 @@ RPC_NUMBERS: Final = (
         mode_fn=lambda _: NumberMode.SLIDER,
         step_fn=lambda config: config["meta"]["ui"].get("step"),
         unit=get_virtual_component_unit,
-        method="number_set",
+        method=lambda device, id_, value: device.number_set(id_, value),
         role="target_humidity",
         models={MODEL_LINKEDGO_ST802_THERMOSTAT, MODEL_LINKEDGO_ST1820_THERMOSTAT},
     ),
@@ -310,7 +337,7 @@ RPC_NUMBERS: Final = (
         mode_fn=lambda _: NumberMode.SLIDER,
         step_fn=lambda config: config["meta"]["ui"].get("step"),
         unit=get_virtual_component_unit,
-        method="number_set",
+        method=lambda device, id_, value: device.number_set(id_, value),
         role="target_temperature",
         models={MODEL_LINKEDGO_ST802_THERMOSTAT, MODEL_LINKEDGO_ST1820_THERMOSTAT},
     ),
@@ -324,7 +351,7 @@ RPC_NUMBERS: Final = (
         native_step=1,
         mode=NumberMode.SLIDER,
         native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
-        method="blu_trv_set_valve_position",
+        method=lambda device, id_, value: device.blu_trv_set_valve_position(id_, value),
         removal_condition=lambda config, _, key: (
             config[key].get("enable", True) is True
         ),
@@ -341,13 +368,13 @@ RPC_NUMBERS: Final = (
         native_step=1,
         mode=NumberMode.SLIDER,
         native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
-        method="cury_set",
-        slot="left",
+        method=lambda device, id_, value: device.cury_set(
+            id_, slot="left", intensity=round(value)
+        ),
         available=lambda status: (
             (left := status["left"]) is not None
             and left.get("vial", {}).get("level", -1) != -1
         ),
-        entity_class=RpcCuryIntensityNumber,
     ),
     RpcNumberDescription(
         key="right_slot_intensity",
@@ -360,13 +387,13 @@ RPC_NUMBERS: Final = (
         native_step=1,
         mode=NumberMode.SLIDER,
         native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
-        method="cury_set",
-        slot="right",
+        method=lambda device, id_, value: device.cury_set(
+            id_, slot="right", intensity=round(value)
+        ),
         available=lambda status: (
             (right := status["right"]) is not None
             and right.get("vial", {}).get("level", -1) != -1
         ),
-        entity_class=RpcCuryIntensityNumber,
     ),
     RpcNumberDescription(
         key="ledstrip_speed",
@@ -378,7 +405,9 @@ RPC_NUMBERS: Final = (
         native_step=1,
         mode=NumberMode.SLIDER,
         native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
-        method="ledstrip_set",
+        method=lambda device, id_, value: device.ledstrip_set(
+            id_, {"speed": round(value)}
+        ),
         supported=lambda _: True,
         entity_class=RpcLedStripNumber,
     ),
@@ -392,9 +421,37 @@ RPC_NUMBERS: Final = (
         native_step=1,
         mode=NumberMode.SLIDER,
         native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
-        method="ledstrip_set",
+        method=lambda device, id_, value: device.ledstrip_set(
+            id_, {"intensity": round(value)}
+        ),
         supported=lambda _: True,
         entity_class=RpcLedStripNumber,
+    ),
+)
+
+
+WALL_DISPLAY_BRIGHTNESS_NUMBERS: Final = (
+    RpcWallDisplayBrightnessNumberDescription(
+        key="level",
+        translation_key="display_brightness",
+        entity_category=EntityCategory.CONFIG,
+        native_min_value=0,
+        native_max_value=100,
+        native_step=1,
+        mode=NumberMode.SLIDER,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
+        entity_class=RpcWallDisplayLevelNumber,
+    ),
+    RpcWallDisplayBrightnessNumberDescription(
+        key="min_level",
+        translation_key="min_auto_display_brightness",
+        entity_category=EntityCategory.CONFIG,
+        native_min_value=1,
+        native_max_value=50,
+        native_step=1,
+        mode=NumberMode.SLIDER,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
+        entity_class=RpcWallDisplayBrightnessNumber,
     ),
 )
 
@@ -441,6 +498,15 @@ def _async_setup_rpc_entry(
     async_setup_entry_rpc(
         hass, config_entry, async_add_entities, RPC_NUMBERS, RpcNumber
     )
+
+    # The Wall Display does not report the ui component in the status
+    if is_rpc_wall_display_brightness_supported(coordinator):
+        brightness = coordinator.device.config["ui"]["brightness"]
+        async_add_entities(
+            description.entity_class(coordinator, description)
+            for description in WALL_DISPLAY_BRIGHTNESS_NUMBERS
+            if description.key in brightness
+        )
 
     # the user can remove virtual components from the device configuration, so
     # we need to remove orphaned entities

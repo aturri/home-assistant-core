@@ -65,8 +65,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MieleConfigEntry) -> Non
     )
 
     await _coordinator.async_config_entry_first_refresh()
-    await _aux_coordinator.async_config_entry_first_refresh()
-    await _failure_coordinator.async_config_entry_first_refresh()
+    # Filling levels are optional. Their endpoint fails independently of the
+    # appliance data, so a failure must not block setup of the whole entry.
+    await _aux_coordinator.async_refresh()
+    # Failure details are optional and fetched on demand. Do not use
+    # async_config_entry_first_refresh so a refresh failure cannot block setup.
+    await _failure_coordinator.async_refresh()
 
     entry.async_create_background_task(
         hass,

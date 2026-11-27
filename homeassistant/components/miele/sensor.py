@@ -844,9 +844,7 @@ FAILURE_SENSOR_TYPES: Final[tuple[MieleSensorDefinition[MieleFailureData], ...]]
             translation_key="fault_code",
             value_fn=lambda value: (
                 None
-                if not value
-                or value.error_number() is None
-                or value.error_number() == 0
+                if value.error_number() is None or value.error_number() == 0
                 else f"F{value.error_number()}"
             ),
             entity_category=EntityCategory.DIAGNOSTIC,
@@ -886,7 +884,7 @@ FAILURE_SENSOR_TYPES: Final[tuple[MieleSensorDefinition[MieleFailureData], ...]]
         description=MieleSensorDescription[MieleFailureData](
             key="fault_message",
             translation_key="fault_message",
-            value_fn=lambda value: value.message() if value else None,
+            value_fn=lambda value: value.message(),
             entity_category=EntityCategory.DIAGNOSTIC,
         ),
     ),
@@ -1036,14 +1034,40 @@ async def async_setup_entry(
     config_entry.async_on_unload(coordinator.async_add_listener(_async_add_devices))
     _async_add_devices()
 
-    async_add_entities(
-        MieleAuxSensor(aux_coordinator, device_id, definition.description)
-        for device_id in aux_coordinator.data.filling_levels
-        for definition in POLLED_SENSOR_TYPES
-        if _enabled_aux_sensor(
-            definition, aux_coordinator.data.filling_levels[device_id]
+    def _async_add_aux_sensors() -> None:
+        async_add_entities(
+            MieleAuxSensor(aux_coordinator, device_id, definition.description)
+            for device_id, level in aux_coordinator.data.filling_levels.items()
+            for definition in POLLED_SENSOR_TYPES
+            if _enabled_aux_sensor(definition, level)
         )
+
+    if aux_coordinator.data_or_none:
+        _async_add_aux_sensors()
+        return
+
+    # Fetching filling levels failed at setup. Add the sensors after the first
+    # successful poll, then stop listening, so that from then on the coordinator
+    # only polls while sensors use it, as after a successful setup.
+    remove_aux_listener: Callable[[], None] | None = None
+
+    @callback
+    def _async_add_aux_sensors_on_recovery() -> None:
+        nonlocal remove_aux_listener
+        if remove_aux_listener:
+            remove_aux_listener()
+            remove_aux_listener = None
+            _async_add_aux_sensors()
+
+    @callback
+    def _async_remove_aux_listener() -> None:
+        if remove_aux_listener:
+            remove_aux_listener()
+
+    remove_aux_listener = aux_coordinator.async_add_listener(
+        _async_add_aux_sensors_on_recovery
     )
+    config_entry.async_on_unload(_async_remove_aux_listener)
 
 
 APPLIANCE_ICONS = {
@@ -1195,11 +1219,9 @@ class MieleFailureSensor(MieleFailureEntity, SensorEntity):
     @override
     def native_value(self) -> StateType | datetime:
         """Return the state of the failure sensor."""
-        return (
-            self.entity_description.value_fn(self.failure)
-            if self.entity_description.value_fn is not None
-            else None
-        )
+        if self.failure is None or self.entity_description.value_fn is None:
+            return None
+        return self.entity_description.value_fn(self.failure)
 
 
 class MielePlateSensor(MieleSensor):
